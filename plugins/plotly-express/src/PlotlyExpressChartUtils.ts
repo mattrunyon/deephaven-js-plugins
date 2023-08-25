@@ -7,25 +7,29 @@ const log = Log.module('@deephaven/js-plugin-plotly-express.ChartUtils');
 
 export interface PlotlyChartWidget {
   getDataAsBase64(): string;
+  getDataAsString(): string;
   exportedObjects: { fetch(): Promise<Table> }[];
 }
 
 export interface PlotlyChartWidgetData {
-  deephaven: {
-    mappings: Array<{
-      table: number;
-      data_columns: Record<string, string[]>;
-    }>;
-    is_user_set_template: boolean;
-    is_user_set_color: boolean;
+  type: string;
+  figure: {
+    deephaven: {
+      mappings: Array<{
+        table: number;
+        data_columns: Record<string, string[]>;
+      }>;
+      is_user_set_template: boolean;
+      is_user_set_color: boolean;
+    };
+    plotly: PlotlyDataLayoutConfig;
   };
-  plotly: PlotlyDataLayoutConfig;
 }
 
 export function getWidgetData(
   widgetInfo: PlotlyChartWidget
 ): PlotlyChartWidgetData {
-  return JSON.parse(atob(widgetInfo.getDataAsBase64()));
+  return JSON.parse(widgetInfo.getDataAsString());
 }
 
 export async function getDataMappings(
@@ -40,7 +44,7 @@ export async function getDataMappings(
   const tableColumnReplacementMap = new Map<Table, Map<string, string[]>>();
   tables.forEach(table => tableColumnReplacementMap.set(table, new Map()));
 
-  data.deephaven.mappings.forEach(
+  data.figure.deephaven.mappings.forEach(
     ({ table: tableIndex, data_columns: dataColumns }) => {
       const table = tables[tableIndex];
       const existingColumnMap = tableColumnReplacementMap.get(table);

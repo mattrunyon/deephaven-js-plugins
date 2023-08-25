@@ -7,53 +7,51 @@ import type {
 } from '@deephaven/jsapi-types';
 import { ChartModel, ChartUtils, ChartTheme } from '@deephaven/chart';
 import Log from '@deephaven/log';
-import { applyColorwayToData } from './PlotlyExpressChartUtils.js';
+import {
+  PlotlyChartWidget,
+  applyColorwayToData,
+  getDataMappings,
+  getWidgetData,
+} from './PlotlyExpressChartUtils.js';
 
 const log = Log.module('@deephaven/js-plugin-plotly-express.ChartModel');
 
 export class PlotlyExpressChartModel extends ChartModel {
-  constructor(
-    dh: DhType,
-    tableColumnReplacementMap: ReadonlyMap<Table, Map<string, string[]>>,
-    data: Data[],
-    plotlyLayout: Partial<Layout>,
-    isDefaultTemplate = true,
-    theme: typeof ChartTheme = ChartTheme
-  ) {
+  constructor(dh: DhType, widget: PlotlyChartWidget, theme = ChartTheme) {
     super(dh);
 
     this.handleFigureUpdated = this.handleFigureUpdated.bind(this);
 
+    this.widget = widget;
     this.chartUtils = new ChartUtils(dh);
-    this.tableColumnReplacementMap = new Map(tableColumnReplacementMap);
+    this.tableColumnReplacementMap = new Map();
     this.chartDataMap = new Map();
     this.tableSubscriptionMap = new Map();
 
     this.theme = theme;
-    this.data = data;
+    this.plotlyLayout = {};
+    this.data = [];
+
     const template = { layout: this.chartUtils.makeDefaultLayout(theme) };
 
-    // For now we will only use the plotly theme colorway since most plotly themes are light mode
-    if (!isDefaultTemplate) {
-      template.layout.colorway =
-        plotlyLayout.template?.layout?.colorway ?? template.layout.colorway;
-    }
-
-    this.plotlyLayout = plotlyLayout;
-
     this.layout = {
-      ...plotlyLayout,
       template,
     };
 
-    applyColorwayToData(
-      this.layout?.template?.layout?.colorway ?? [],
-      this.plotlyLayout?.template?.layout?.colorway ?? [],
-      this.data
-    );
-
     this.setTitle(this.getDefaultTitle());
+
+    // @ts-ignore
+    this.widget.addEventListener(
+      'message',
+      async ({ detail }: { detail: PlotlyChartWidget }) => {
+        this.stopListening();
+        await this.init(detail);
+        this.startListening();
+      }
+    );
   }
+
+  widget: PlotlyChartWidget;
 
   chartUtils: ChartUtils;
 
@@ -73,39 +71,60 @@ export class PlotlyExpressChartModel extends ChartModel {
 
   plotlyLayout: Partial<Layout>;
 
-  getData(): Partial<Data>[] {
+  isListening = false;
+
+  async init(widget: PlotlyChartWidget): Promise<void> {
+    this.widget = widget;
+
+    const { figure } = getWidgetData(widget);
+    const { plotly, deephaven } = figure;
+    const isDefaultTemplate = !deephaven.is_user_set_template;
+
+    this.data = plotly.data;
+    this.plotlyLayout = plotly.layout ?? {};
+
+    const template = { layout: this.chartUtils.makeDefaultLayout(this.theme) };
+
+    // For now we will only use the plotly theme colorway since most plotly themes are light mode
+    if (!isDefaultTemplate) {
+      template.layout.colorway =
+        this.plotlyLayout.template?.layout?.colorway ??
+        template.layout.colorway;
+    }
+
+    this.layout = {
+      ...this.plotlyLayout,
+      template,
+    };
+
+    applyColorwayToData(
+      this.layout?.template?.layout?.colorway ?? [],
+      this.plotlyLayout?.template?.layout?.colorway ?? [],
+      this.data
+    );
+
+    const tableColumnReplacementMap = await getDataMappings(widget);
+    this.tableColumnReplacementMap = new Map(tableColumnReplacementMap);
+  }
+
+  override getData(): Partial<Data>[] {
     return this.data;
   }
 
-  getLayout(): Partial<Layout> {
+  override getLayout(): Partial<Layout> {
     return this.layout;
   }
 
-  subscribe(callback: (event: CustomEvent) => void): void {
+  override subscribe(callback: (event: CustomEvent) => void): void {
     super.subscribe(callback);
-
-    const { dh } = this;
-
-    this.tableColumnReplacementMap.forEach((_, table) =>
-      this.chartDataMap.set(table, new dh.plot.ChartData(table))
-    );
-
-    this.tableColumnReplacementMap.forEach((columnReplacements, table) => {
-      const columnNames = new Set(columnReplacements.keys());
-      const columns = table.columns.filter(({ name }) => columnNames.has(name));
-      this.tableSubscriptionMap.set(table, table.subscribe(columns));
-    });
 
     this.startListening();
   }
 
-  unsubscribe(callback: (event: CustomEvent) => void): void {
+  override unsubscribe(callback: (event: CustomEvent) => void): void {
     super.unsubscribe(callback);
 
     this.stopListening();
-
-    this.tableSubscriptionMap.forEach(sub => sub.close());
-    this.chartDataMap.clear();
   }
 
   handleFigureUpdated(
@@ -146,10 +165,29 @@ export class PlotlyExpressChartModel extends ChartModel {
     });
 
     const { data } = this;
-    this.fireUpdate(data);
+
+    if (this.isListening) {
+      this.fireUpdate(data);
+    }
   }
 
-  startListening(): void {
+  async startListening(): Promise<void> {
+    const { dh } = this;
+
+    if (this.tableColumnReplacementMap.size === 0) {
+      await this.init(this.widget);
+    }
+
+    this.tableColumnReplacementMap.forEach((_, table) =>
+      this.chartDataMap.set(table, new dh.plot.ChartData(table))
+    );
+
+    this.tableColumnReplacementMap.forEach((columnReplacements, table) => {
+      const columnNames = new Set(columnReplacements.keys());
+      const columns = table.columns.filter(({ name }) => columnNames.has(name));
+      this.tableSubscriptionMap.set(table, table.subscribe(columns));
+    });
+
     this.tableSubscriptionMap.forEach((sub, table) => {
       this.tableSubscriptionCleanups.push(
         sub.addEventListener(this.dh.Table.EVENT_UPDATED, e =>
@@ -161,10 +199,17 @@ export class PlotlyExpressChartModel extends ChartModel {
         )
       );
     });
+
+    this.isListening = true;
   }
 
   stopListening(): void {
+    this.isListening = false;
     this.tableSubscriptionCleanups.forEach(cleanup => cleanup());
+    this.tableSubscriptionMap.forEach(sub => sub.close());
+    this.chartDataMap.clear();
+    this.tableSubscriptionMap.clear();
+    this.tableSubscriptionCleanups = [];
   }
 
   getPlotWidth(): number {
